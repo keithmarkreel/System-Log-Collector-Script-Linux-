@@ -1,0 +1,35 @@
+Setup Commands
+
+If it fails try:
+
+sudo systemctl enable --now ssh
+
+Admin must:
+1. Install ssh and sqlite3(for browser history) via:
+
+sudo apt install -y openssh-client sqlite3
+
+2. Save or download the script.
+3. Set Script permissions using chmod to make it an executable via:
+
+chmod +x (script name).sh
+
+4. Create Target Inventory
+Create hosts.txt in the exact same directory as your script.
+You can write either plain IPs or username@IP:
+
+cat <<EOF > hosts.txt
+kali@192.168.0.223
+EOF
+
+5. Verify Target Parsing:
+
+./collect_audit_manual.sh list
+
+6. Run Setup via.
+
+./collect_audit_manual.sh setup
+
+7. run Audit pull:
+
+./collect_audit_manual.sh collect
