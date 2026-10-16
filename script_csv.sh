@@ -10,8 +10,11 @@
 # Usage:
 #   ./script_flipside.sh list       # show which hosts would be contacted
 #   ./script_flipside.sh setup      # ONE-TIME (or after any update): install SSH key + collector on each PC
-#   ./script_flipside.sh collect    # sequential log collection run (fast)
+#   ./script_flipside.sh collect    # log collection, all PCs at the same time (JOBS=1 for one by one)
 #   ./script_flipside.sh scan       # same as collect + ClamAV scan of the AM/PM/ADMIN home folders (slow)
+#
+# Also builds the monthly tracking-sheet rows (hardware inventory + ScanLog / Infected File Count /
+# Invalid Entry columns) in:  $REPORTS_ROOT/<Month> Scan Logs/scan_log_<Month>.csv
 #
 # Besides the full per-PC folders, every run also files the per-account reports in the
 # monthly folder layout:
@@ -21,21 +24,50 @@
 set -euo pipefail
 
 # ---------------- CONFIG ----------------
-ADMIN_IP="192.168.0.93"
+ADMIN_IP="192.168.0.94"
 SUBNET="192.168.0.0/24"
 SUBNET_PREFIX="192.168.0"
-SSH_USER="${SSH_USER:-kali}"
-OUT_ROOT="${OUT_ROOT:-$HOME/audit-logs}"
+SSH_USER="${SSH_USER:-admin2025}"
 DAYS=35
 COLLECT_BROWSER=1
 HOSTS_FILE="$(dirname "$(readlink -f "$0")")/hosts.txt"
 
 # Shift accounts (the accounts being audited, not the SSH_USER collector account)
-AM_USER="${AM_USER:-am}"              # morning-shift account (/home/am)
-PM_USER="${PM_USER:-pm}"              # afternoon-shift account (/home/pm)
+AM_USER="${AM_USER:-AM}"              # morning-shift account (matched case-insensitively)
+PM_USER="${PM_USER:-PM}"              # afternoon-shift account (matched case-insensitively)
 ADMIN_USER="${ADMIN_USER:-admin2025}"
+SITE="${SITE:-}"                           # tracking-sheet columns that can't be detected (optional)
+AREA="${AREA:-}"
+DEPARTMENT="${DEPARTMENT:-}"
+JOBS="${JOBS:-0}"                          # PCs processed at the same time: 0 = all at once, 1 = one by one
+EXCLUDE_IPS="${EXCLUDE_IPS:-192.168.0.43}"             # hosts to skip, space/comma separated, e.g. "192.168.0.21 192.168.0.30"
+
+# Where results are saved on THIS (admin) PC: the ADMIN account's home (/home/admin2025/audit-logs).
+# If that account doesn't exist here, the account the script was run from is used instead
+# (even if you switched to root with su/sudo).
+# Override with OUT_ROOT=/some/folder or OUT_USER=<account>.
+if [ -z "${OUT_USER:-}" ]; then
+  if id -u "$ADMIN_USER" >/dev/null 2>&1; then
+    OUT_USER="$ADMIN_USER"
+  elif [ "$EUID" -ne 0 ]; then
+    OUT_USER=$(id -un)
+  elif [ -n "${SUDO_USER:-}" ] && [ "$SUDO_USER" != "root" ]; then
+    OUT_USER="$SUDO_USER"
+  else
+    OUT_USER=$(stat -c %U "$(readlink -f "$0")" 2>/dev/null || echo root)   # owner of the script file
+  fi
+fi
+if [ -z "${OUT_ROOT:-}" ]; then
+  _out_home=$(getent passwd "$OUT_USER" 2>/dev/null | cut -d: -f6 || true)
+  if [ -n "$_out_home" ] && [ -d "$_out_home" ]; then
+    OUT_ROOT="$_out_home/audit-logs"
+  else
+    OUT_ROOT="$HOME/audit-logs"
+  fi
+fi
 REPORTS_ROOT="${REPORTS_ROOT:-$OUT_ROOT}"   # where "<Month> Scan Logs" is created (e.g. /media/kali/NEW)
 ENV_FOLDER="Production"                    # folder under "<Month> Scan Logs"
+SCAN_DAYS="${SCAN_DAYS:-30}"               # scan only files modified/changed in the last N days (0 = scan everything)
 CLAM_SCAN="${CLAM_SCAN:-0}"           # 1 = also run clamscan on each account home (or use: ./script scan)
 # ----------------------------------------
 
@@ -49,11 +81,12 @@ cat > "$1" <<'REMOTE'
 set -uo pipefail
 
 DAYS="${1:-35}"; BROWSER="${2:-0}"
-AM_USER="${3:-am}"; PM_USER="${4:-pm}"; ADMIN_USER="${5:-admin2025}"
-SCAN="${6:-0}"
+AM_USER="${3:-AM}"; PM_USER="${4:-PM}"; ADMIN_USER="${5:-admin2025}"
+SCAN="${6:-0}"; SCAN_DAYS="${7:-0}"
 [[ "$DAYS" =~ ^[0-9]+$ ]] || exit 2
 [[ "$BROWSER" =~ ^[01]$ ]] || exit 2
 [[ "$SCAN" =~ ^[01]$ ]] || exit 2
+[[ "$SCAN_DAYS" =~ ^[0-9]+$ ]] || exit 2
 for u in "$AM_USER" "$PM_USER" "$ADMIN_USER"; do
   [[ "$u" =~ ^[A-Za-z_][A-Za-z0-9_.-]*$ ]] || exit 2
 done
@@ -69,10 +102,55 @@ trap cleanup EXIT
 trap 'exit 1' HUP INT TERM
 mkdir -p "$W"/{auth,system,apps,browser}
 
+resolve_user() {   # case-insensitive lookup of the real account name (AM vs am)
+  local r
+  r=$(getent passwd | cut -d: -f1 | grep -ixF -- "$1" | head -n1)
+  echo "${r:-$1}"
+}
+
+# ---- Hardware / OS inventory for the monthly tracking sheet -> inventory.txt (key=value) ----
+collect_inventory() {
+  local inv="$W/inventory.txt" model short gen n mem sticks line name size rota serial type dev mac conn gpu osn
+  model=$(lscpu 2>/dev/null | awk -F: '/Model name/ { gsub(/^[ \t]+/, "", $2); print $2; exit }')
+  short="$model"; gen=""
+  if [[ "$model" =~ (i[3579])-([0-9]{4,5}) ]]; then
+    short="${BASH_REMATCH[1]}"; n="${BASH_REMATCH[2]}"
+    if [ "${#n}" -eq 5 ]; then n="${n:0:2}"; else n="${n:0:1}"; fi
+    case "$n" in 1) gen="1st";; 2) gen="2nd";; 3) gen="3rd";; *) gen="${n}th";; esac
+  fi
+  mem=$(awk '/MemTotal/ { printf "%d", ($2/1048576)+0.5 }' /proc/meminfo 2>/dev/null)
+  sticks=$(dmidecode -t memory 2>/dev/null | awk '
+    /^[ \t]+Size: [0-9]+ (MB|GB)/ { s=$2; if ($3=="MB") s=s/1024; c[s]++ }
+    END { o=""; for (k in c) o = o (o ? "+" : "") c[k] "x" k " GB"; print o }')
+  line=$(lsblk -dbnP -o NAME,SIZE,ROTA,SERIAL,TYPE,RM 2>/dev/null | grep 'TYPE="disk"' | grep 'RM="0"' | head -n1)
+  name=$(sed -n 's/.*NAME="\([^"]*\)".*/\1/p' <<<"$line")
+  size=$(sed -n 's/.*SIZE="\([^"]*\)".*/\1/p' <<<"$line")
+  rota=$(sed -n 's/.*ROTA="\([^"]*\)".*/\1/p' <<<"$line")
+  serial=$(sed -n 's/.*SERIAL="\([^"]*\)".*/\1/p' <<<"$line" | sed 's/[[:space:]]*$//')
+  [ -n "$size" ] && size="$(awk -v b="$size" 'BEGIN { printf "%d", (b/1000000000)+0.5 }') GB"
+  case "$name" in nvme*) type="NVMe SSD";; "") type="";; *) if [ "$rota" = "1" ]; then type="HDD"; else type="SSD"; fi;; esac
+  gpu=$(lspci 2>/dev/null | grep -Ei 'vga compatible|3d controller|display controller' \
+        | sed -E 's/^[^ ]+ [^:]+: //; s/ \(rev [0-9a-f]+\)//' | paste -sd';' -)
+  osn=$( . /etc/os-release 2>/dev/null; echo "${NAME:-} ${VERSION_ID:-}" )
+  dev=$(ip -o -4 route show to default 2>/dev/null | awk '{ print $5; exit }')
+  mac=""; conn=""
+  if [ -n "$dev" ]; then
+    mac=$(cat "/sys/class/net/$dev/address" 2>/dev/null)
+    if [ -d "/sys/class/net/$dev/wireless" ]; then conn="Wireless"; else conn="Wired"; fi
+  fi
+  {
+    echo "cpu=$short"; echo "cpu_model=$model"; echo "cpu_gen=$gen"
+    echo "memory=${mem:+${mem}GB}"; echo "sticks=$sticks"
+    echo "disk_size=$size"; echo "disk_type=$type"; echo "disk_serial=$serial"
+    echo "gpu=$gpu"; echo "os=$osn"; echo "mac=$mac"; echo "conn=$conn"
+  } > "$inv"
+}
+
 # ---- Supervisor-format entry file for one account (login / failed login / sudo) ----
 # usage: build_entry_file <Label> <username> <rawlogfile> <outfile>
 build_entry_file() {
   local label="$1" user="$2" raw="$3" outf="$4" re mine lg fl sd
+  user=$(resolve_user "$user")
   mine=$(mktemp); lg=$(mktemp); fl=$(mktemp); sd=$(mktemp)
   re="(user[= ]|for |by |logname=|sudo(\[[0-9]+\])?: )${user}([^A-Za-z0-9_-]|\$)"
   grep -iE "$re" "$raw" > "$mine"
@@ -100,6 +178,31 @@ build_entry_file() {
   rm -f "$mine" "$lg" "$fl" "$sd"
 }
 
+# Scan one home folder (read-only). SCAN_DAYS > 0 = only files modified or changed in the last N days.
+scan_one() {
+  local home="$1" out="$2" list
+  if [ "$SCAN_DAYS" -gt 0 ]; then
+    list=$(mktemp)
+    find "$home" -type f \( -mtime "-$SCAN_DAYS" -o -ctime "-$SCAN_DAYS" \) 2>/dev/null > "$list"
+    {
+      echo "Scan scope: files modified or changed in the last $SCAN_DAYS days under $home"
+      if [ -s "$list" ]; then
+        # READ-ONLY scan: never add --remove / --move / --copy here
+        clamscan --file-list="$list"
+      else
+        printf '\n----------- SCAN SUMMARY -----------\nScanned directories: 0\nScanned files: 0\nInfected files: 0\n(no files were modified or changed in this period)\n'
+      fi
+    } > "$out"
+    rm -f "$list"
+  else
+    {
+      echo "Scan scope: all files under $home"
+      # READ-ONLY scan: never add --remove / --move / --copy here
+      clamscan -r "$home"
+    } > "$out"
+  fi
+}
+
 # ---- ClamAV scan of each account home (same as the supervisor script) ----
 run_clam_scans() {
   mkdir -p "$W/scan"
@@ -112,10 +215,10 @@ run_clam_scans() {
   fi
   local pair label user home
   for pair in "Admin:$ADMIN_USER" "AM:$AM_USER" "PM:$PM_USER"; do
-    label=${pair%%:*}; user=${pair#*:}
+    label=${pair%%:*}; user=$(resolve_user "${pair#*:}")
     home=$(getent passwd "$user" | cut -d: -f6); home=${home:-/home/$user}
     if [ -d "$home" ]; then
-      clamscan -r "$home" > "$W/scan/result_$label.txt"
+      scan_one "$home" "$W/scan/result_$label.txt"
     else
       echo "Home folder not found: $home" > "$W/scan/result_$label.txt"
     fi
@@ -254,6 +357,7 @@ fi
 
 # AM / PM / ADMIN account breakdown
 collect_shift_logins
+collect_inventory
 [ "$SCAN" -eq 1 ] && run_clam_scans
 
 # ---- System Logs ----
@@ -309,20 +413,37 @@ tar -czf - -C "$W" .
 REMOTE
 }
 
-discover_hosts() {
+discover_hosts_raw() {
+  local found="" i ip
   if [ -f "$HOSTS_FILE" ]; then
-    grep -Ev '^\s*(#|$)' "$HOSTS_FILE" | grep -vx "$ADMIN_IP"
-    return
+    grep -Ev '^\s*(#|$)' "$HOSTS_FILE" | grep -vx "$ADMIN_IP" || true
+    return 0
   fi
   if command -v nmap >/dev/null 2>&1; then
-    nmap -n -p22 --open -oG - "$SUBNET" | awk '/22\/open/{print $2}' | grep -vx "$ADMIN_IP" | sort -V
-  else
-    for i in $(seq 1 254); do
+    # -sT = plain TCP connect scan: works as root and with snap-installed nmap,
+    # which cannot open raw sockets ("Couldn't open a raw socket" with the default scan)
+    found=$(nmap -sT -n -p22 --open -oG - "$SUBNET" 2>/dev/null | awk '/22\/open/{print $2}' || true)
+  fi
+  if [ -z "$found" ]; then
+    # fallback (no nmap, or nmap failed): parallel bash /dev/tcp probes
+    found=$(for i in $(seq 1 254); do
       ip="$SUBNET_PREFIX.$i"
       ( timeout 1 bash -c "</dev/tcp/$ip/22" 2>/dev/null && echo "$ip" ) &
-    done | grep -vx "$ADMIN_IP" | sort -V
-    wait
+    done; wait)
   fi
+  printf '%s\n' "$found" | grep . | grep -vx "$ADMIN_IP" | sort -V || true
+  return 0
+}
+
+# discover_hosts = discovery minus anything listed in EXCLUDE_IPS
+discover_hosts() {
+  local out
+  out=$(discover_hosts_raw) || true
+  if [ -n "${EXCLUDE_IPS//[ ,]/}" ]; then
+    out=$(printf '%s\n' "$out" | grep -vxF -f <(printf '%s\n' ${EXCLUDE_IPS//,/ }) || true)
+  fi
+  [ -n "$out" ] && printf '%s\n' "$out"
+  return 0
 }
 
 extract_history() {
@@ -347,6 +468,95 @@ extract_history() {
   done
   shopt -u nullglob
   rm -rf "$dest/browser"
+}
+
+# ---------- Monthly tracking sheet (CSV in the same column order as the sheet) ----------
+csvq() { local v="${1//\"/\"\"}"; printf '"%s"' "$v"; }
+inv_get() { awk -F= -v k="$2" '$1==k { sub(/^[^=]*=/, ""); print; exit }' "$1" 2>/dev/null; }
+
+init_sheet_csv() {
+  local mname m mm
+  mname=$(LC_ALL=C date +%B); m=$(date +%-m); mm=$(date +%m)
+  SHEET_CSV="$REPORTS_ROOT/$mname Scan Logs/scan_log_${mname}.csv"
+  mkdir -p "$(dirname "$SHEET_CSV")"
+  local header="Site,Area,Department,Hostname,Processor,Processor Generation,Memory,Number of Memory Stick,Storage Capacity,Storage Type,Storage Serial,GPU,OS,Compatible with windows 11,OS Activated,IP Address,MAC Address,Connectiontype,${mname} Status,ScanLog${m},Date${mm},Infected File Count${mm},Scanned Files${mm},Infected File Remarks${mm},Invalid Entry${mm},Invalid Entry Remarks${mm},System Update${mm},Date0${mm},Ping Test${m},Date00${mm},SpeedTest${m},Date000${mm},Crimp Eval${m},Date0000${mm}"
+  if [ -f "$SHEET_CSV" ]; then
+    [ "$(head -n1 "$SHEET_CSV")" = "$header" ] && return 0
+    mv "$SHEET_CSV" "$SHEET_CSV.old-layout.bak"      # columns changed: keep the old file, start a new one
+  fi
+  printf '%s\n' "$header" > "$SHEET_CSV"
+}
+
+# usage: append_sheet_row <host_dir> <hostname> <ip>   (re-running replaces that host's row)
+append_sheet_row() {
+  local dest="$1" pc="$2" ip="$3" inv="$dest/inventory.txt" cnt="$dest/auth/shift/counts.tsv"
+  local scan_done="" inf="" scanned="" inf_rem="" inv_n="" inv_rem="" parts="" others="" L c f row tmp
+  local -a res=()
+  shopt -s nullglob; res=("$dest"/scan/result_*.txt); shopt -u nullglob
+
+  # ClamAV columns (only filled when the scan mode was used)
+  if [ -f "$dest/scan/NOT_INSTALLED.txt" ]; then
+    scan_done="ClamAV not installed"
+  elif [ "${#res[@]}" -gt 0 ]; then
+    if grep -q 'SCAN SUMMARY' "${res[@]}" 2>/dev/null; then scan_done="Done"; else scan_done="Not completed"; fi
+    inf=$(grep -h 'Infected files' "${res[@]}" 2>/dev/null | awk '{ s += $3 } END { print s+0 }' || true)
+    scanned=$(grep -h '^Scanned files:' "${res[@]}" 2>/dev/null | awk '{ s += $3 } END { print s+0 }' || true)
+    for L in Admin AM PM; do
+      f="$dest/scan/result_$L.txt"; [ -f "$f" ] || continue
+      c=$(grep -h 'Infected files' "$f" 2>/dev/null | awk '{ print $3 }' | head -n1 || true)
+      parts+="${parts:+, }$L ${c:-n/a}"
+    done
+    if [ "${inf:-0}" -eq 0 ]; then
+      inf_rem="n/a"
+    else
+      # name the infected files (clamscan prints "<path>: <signature> FOUND")
+      local found nfound list
+      found=$(grep -h ' FOUND$' "${res[@]}" 2>/dev/null | sed 's/ FOUND$//' || true)
+      nfound=$(printf '%s\n' "$found" | grep -c . || true)
+      list=$(printf '%s\n' "$found" | head -n 3 | paste -sd';' - || true)
+      [ "${nfound:-0}" -gt 3 ] && list+="; +$((nfound - 3)) more"
+      inf_rem="Infected files found ($parts): ${list:-see Scan Logs} - see Scan Logs"
+    fi
+  fi
+
+  # Invalid entries = failed logins + failed sudo attempts (all accounts)
+  if [ -f "$cnt" ]; then
+    parts=""
+    read -r inv_n parts < <(awk -F'\t' '!/^#/ { n=$3+$4; t+=n; if (n>0) p=p (p ? ", " : "") $1 " " n } END { print t+0, p }' "$cnt")
+    others=$(awk -F'\t' '/^#other/ { printf "%s%s", (c++ ? "," : ""), $2 }' "$cnt")
+    if [ "${inv_n:-0}" -eq 0 ]; then inv_rem="None"
+    else
+      inv_rem="$inv_n failed attempts ($parts)"
+      [ -n "$others" ] && inv_rem+="; other accounts: $others"
+      inv_rem+=" - needs review"
+    fi
+  fi
+
+  row=""
+  for f in "$SITE" "$AREA" "$DEPARTMENT" "$pc" \
+           "$(inv_get "$inv" cpu)" "$(inv_get "$inv" cpu_gen)" "$(inv_get "$inv" memory)" "$(inv_get "$inv" sticks)" \
+           "$(inv_get "$inv" disk_size)" "$(inv_get "$inv" disk_type)" "$(inv_get "$inv" disk_serial)" \
+           "$(inv_get "$inv" gpu)" "$(inv_get "$inv" os)" "" "" \
+           "$ip" "$(inv_get "$inv" mac)" "$(inv_get "$inv" conn)" "Active" \
+           "$scan_done" "$(date +%F)" "$inf" "$scanned" "$inf_rem" "$inv_n" "$inv_rem" \
+           "" "" "" "" "" "" "" ""; do
+    row+="${row:+,}$(csvq "$f")"
+  done
+
+  tmp=$(mktemp)
+  grep -vE "^([^,]*,){3}\"${pc}\"," "$SHEET_CSV" > "$tmp" || true
+  printf '%s\n' "$row" >> "$tmp"
+  cat "$tmp" > "$SHEET_CSV"; rm -f "$tmp"
+  return 0
+}
+
+# When run as root, hand the results over to OUT_USER so they aren't root-owned
+own_outputs() {
+  [ "$EUID" -eq 0 ] || return 0
+  id "$OUT_USER" >/dev/null 2>&1 || return 0
+  chown "$OUT_USER": "$OUT_ROOT" 2>/dev/null || true
+  chown -R "$OUT_USER": "$RUN_DIR" "$REPORTS_ROOT/$(LC_ALL=C date +%B) Scan Logs" 2>/dev/null || true
+  return 0
 }
 
 # File the per-account reports in the monthly layout:
@@ -376,11 +586,16 @@ collect_host() {
   mkdir -p "$dest"
 
   if ssh -n "${SSH_OPTS[@]}" "$SSH_USER@$ip" \
-       "sudo -n $REMOTE_BIN '$DAYS' '$COLLECT_BROWSER' '$AM_USER' '$PM_USER' '$ADMIN_USER' '$CLAM_SCAN'" \
+       "sudo -n $REMOTE_BIN '$DAYS' '$COLLECT_BROWSER' '$AM_USER' '$PM_USER' '$ADMIN_USER' '$CLAM_SCAN' '$SCAN_DAYS'" \
        2>"$dest/collect.err" \
        | tar -xzf - -C "$dest" --no-same-owner 2>>"$dest/collect.err"; then
     [ "$COLLECT_BROWSER" -eq 1 ] && extract_history "$dest"
     export_reports "$dest" "$name"
+    if command -v flock >/dev/null 2>&1; then
+      ( flock 9; append_sheet_row "$dest" "$name" "$ip" ) 9>"$SHEET_CSV.lock"
+    else
+      append_sheet_row "$dest" "$name" "$ip"
+    fi
     [ -s "$dest/collect.err" ] || rm -f "$dest/collect.err"
     echo "OK    $ip  -> $dest"
   else
@@ -393,7 +608,7 @@ collect_host() {
 # usage: build_fleet_summary <run_dir> <start_ts> <t0_seconds> <summary_file>
 build_fleet_summary() {
   local run_dir="$1" start_ts="$2" t0="$3" sfile="$4"
-  local elapsed hosts failed lines infected size c host inf_label
+  local elapsed hosts failed lines infected scanned size c host inf_label
   local -a counts stats clams scans
   shopt -s nullglob
   counts=("$run_dir"/*/auth/shift/counts.tsv)
@@ -408,6 +623,10 @@ build_fleet_summary() {
   lines=0; infected=0
   if [ "${#stats[@]}" -gt 0 ]; then
     lines=$(cat "${stats[@]}" | awk -F'\t' '$1=="log_lines" { s += $2 } END { print s+0 }' || true)
+  fi
+  scanned=0
+  if [ "${#scans[@]}" -gt 0 ]; then
+    scanned=$(grep -h '^Scanned files:' "${scans[@]}" 2>/dev/null | awk '{ s += $3 } END { print s+0 }' || true)
   fi
   inf_label="last scans"
   if [ "${#scans[@]}" -gt 0 ]; then
@@ -433,6 +652,10 @@ build_fleet_summary() {
               printf "%-6s logins: %d | failed logins: %d | sudo failures: %d\n", k, l[k], f[k], s[k] }
             printf "Total logins: %d\nFailed login attempts: %d\nSudo failures: %d\n", TL, TF, TS }' || true
   fi
+  if [ "${#scans[@]}" -gt 0 ]; then
+    if [ "$SCAN_DAYS" -gt 0 ]; then echo "ClamAV scan scope: files modified/changed in the last $SCAN_DAYS days"; else echo "ClamAV scan scope: all files"; fi
+  fi
+  echo "ClamAV scanned files (this run): $scanned"
   echo "ClamAV infected files ($inf_label): $infected"
   echo "Data collected: $size"
   printf 'Time: %d sec (%d m %d s)\n' "$elapsed" "$((elapsed/60))" "$((elapsed%60))"
@@ -446,6 +669,8 @@ build_fleet_summary() {
     echo "[$host]"
     awk -F'\t' '/^#other/ { printf "  other account: %s (%d failed events)\n", $2, $3; next }
                 { printf "  %-6s logins: %d | failed: %d | sudo failures: %d\n", $1,$2,$3,$4 }' "$c" || true
+    grep -h ' FOUND$' "$(dirname "$(dirname "$(dirname "$c")")")"/scan/result_*.txt 2>/dev/null \
+      | sed 's/^/  INFECTED: /' || true
   done
 }
 
@@ -464,6 +689,17 @@ setup_host() {
   '"
 }
 
+no_hosts_help() {
+  cat >&2 <<HELP
+No SSH-reachable hosts were found, so nothing was collected.
+Check:
+  1. Admin PC network:  ip -4 addr   (is it really on $SUBNET? ADMIN_IP=$ADMIN_IP)
+  2. Target PCs are on and running SSH:  sudo systemctl status ssh
+  3. Test one PC by hand:  ssh $SSH_USER@<pc-ip>
+  4. Or list the PCs yourself, one IP per line, in:  $HOSTS_FILE
+HELP
+}
+
 MODE="${1:-collect}"
 
 case "$MODE" in
@@ -476,6 +712,7 @@ case "$MODE" in
     trap 'rm -f "$TMP"' EXIT
     write_collector "$TMP"
     mapfile -t HOSTS < <(discover_hosts)
+    [ "${#HOSTS[@]}" -gt 0 ] || { no_hosts_help; exit 1; }
     echo "Found ${#HOSTS[@]} host(s) to provision."
     for ip in "${HOSTS[@]}"; do
       setup_host "$ip" "$TMP" && echo "  Setup complete: $ip" || echo "  Setup failed: $ip"
@@ -484,6 +721,7 @@ case "$MODE" in
   collect|scan)
     [ "$MODE" = "scan" ] && CLAM_SCAN=1
     REPORT_BASE="$REPORTS_ROOT/$(LC_ALL=C date +%B) Scan Logs/$ENV_FOLDER"
+    init_sheet_csv
     if [ "$COLLECT_BROWSER" -eq 1 ] && ! command -v sqlite3 >/dev/null; then
       echo "Error: sqlite3 required on admin host when COLLECT_BROWSER=1." >&2
       exit 1
@@ -494,14 +732,22 @@ case "$MODE" in
     mkdir -p "$RUN_DIR"
     chmod 700 "$RUN_DIR"
     mapfile -t HOSTS < <(discover_hosts)
-    echo "Collecting sequentially from ${#HOSTS[@]} host(s) into $RUN_DIR..."
+    [ "${#HOSTS[@]}" -gt 0 ] || { no_hosts_help; exit 1; }
+    if [ "$JOBS" -eq 0 ]; then par="all at once"; else par="$JOBS at a time"; fi
+    echo "Collecting from ${#HOSTS[@]} host(s) ($par) into $RUN_DIR..."
 
     summary_file="$RUN_DIR/summary.txt"
     : > "$summary_file"
 
     for ip in "${HOSTS[@]}"; do
-      collect_host "$ip" | tee -a "$summary_file" || true
+      if [ "$JOBS" -gt 0 ]; then
+        while [ "$(jobs -rp | wc -l)" -ge "$JOBS" ]; do sleep 1; done
+      fi
+      echo "START $ip"
+      { collect_host "$ip" || true; } | tee -a "$summary_file" &
     done
+    wait
+    rm -f "$SHEET_CSV.lock"
 
     ok_count=$(grep -c '^OK' "$summary_file" || true)
     fail_count=$(grep -c '^FAIL' "$summary_file" || true)
@@ -513,7 +759,10 @@ case "$MODE" in
     if [ -d "$REPORT_BASE" ]; then
       chmod -R go-rwx "$REPORTS_ROOT/$(LC_ALL=C date +%B) Scan Logs" 2>/dev/null || true
       echo "Entry/Scan log folders: $REPORT_BASE/<PC>/"
+      echo "Tracking-sheet rows:    $SHEET_CSV"
+      [ "$CLAM_SCAN" = "1" ] || echo "Note: ScanLog / Scanned Files / Infected File columns stay blank in collect mode - run: $0 scan"
     fi
+    own_outputs
     ;;
   *)
     echo "Usage: $0 {list|setup|collect|scan}"
